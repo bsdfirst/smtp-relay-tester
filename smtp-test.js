@@ -3,7 +3,7 @@
 
 const net = require('net');
 const tls = require('tls');
-const readline = require('readline');
+const dns = require('dns').promises;
 const { randomUUID } = require('crypto');
 
 // ---------------------------------------------------------------------------
@@ -14,9 +14,10 @@ function usage() {
 Usage: node smtp-test.js <host> <from> <to> [options]
 
 Runs all sensible port/TLS/auth combinations against <host> and reports
-which ones successfully deliver mail.
+which ones successfully deliver mail. By default, each combination is
+tested over both IPv4 and IPv6 (where DNS records exist).
 
-Combinations tested:
+Combinations tested (per IP family):
   Port 25   - plain (no TLS)
   Port 25   - STARTTLS
   Port 587  - STARTTLS
@@ -26,15 +27,16 @@ If --user is provided, each combination is tested twice: anonymous and
 authenticated. If --user is given without --pass, the password is prompted.
 
 Options:
-  --user <user>       AUTH LOGIN username
-  --pass <pass>       AUTH LOGIN password (prompted if --user set without this)
-  --helo <name>       EHLO hostname (default: domain from <from> address)
-  --timeout <ms>      Per-attempt socket timeout in ms (default: 10000)
-  --verbose           Print full SMTP conversation for each attempt
+  --user <user>         AUTH LOGIN username
+  --pass <pass>         AUTH LOGIN password (prompted if --user set without this)
+  --helo <name>         EHLO hostname (default: domain from <from> address)
+  --timeout <ms>        Per-attempt socket timeout in ms (default: 10000)
+  --ip-version <v>      Which IP family to test: 4, 6, or both (default: both)
+  --verbose             Print full SMTP conversation for each attempt
 
 Examples:
   node smtp-test.js smtp.example.com sender@example.org recipient@example.org
-  node smtp-test.js smtp.example.com sender@example.org recipient@example.org --user sender@example.org
+  node smtp-test.js smtp.example.com sender@example.org recipient@example.org --ip-version 4
   node smtp-test.js smtp.example.com sender@example.org recipient@example.org --user me --pass secret --verbose
 `);
   process.exit(1);
@@ -55,19 +57,26 @@ const opts = {
   helo: null,
   timeout: 10000,
   verbose: false,
+  ipVersion: 'both',
 };
 
 for (let i = 3; i < args.length; i++) {
   switch (args[i]) {
-    case '--user':    opts.user = args[++i]; break;
-    case '--pass':    opts.pass = args[++i]; break;
-    case '--helo':    opts.helo = args[++i]; break;
-    case '--timeout': opts.timeout = parseInt(args[++i], 10); break;
-    case '--verbose': opts.verbose = true; break;
+    case '--user':       opts.user = args[++i]; break;
+    case '--pass':       opts.pass = args[++i]; break;
+    case '--helo':       opts.helo = args[++i]; break;
+    case '--timeout':    opts.timeout = parseInt(args[++i], 10); break;
+    case '--ip-version': opts.ipVersion = args[++i]; break;
+    case '--verbose':    opts.verbose = true; break;
     default:
       console.error(`Unknown option: ${args[i]}`);
       usage();
   }
+}
+
+if (!['4', '6', 'both'].includes(opts.ipVersion)) {
+  console.error(`Error: --ip-version must be 4, 6, or both (got: ${opts.ipVersion})`);
+  process.exit(1);
 }
 
 if (!opts.helo) {
@@ -112,6 +121,40 @@ async function promptPassword() {
 }
 
 // ---------------------------------------------------------------------------
+// DNS resolution per family
+// ---------------------------------------------------------------------------
+async function resolveAddresses() {
+  const families = [];
+  if (opts.ipVersion === '4' || opts.ipVersion === 'both') families.push(4);
+  if (opts.ipVersion === '6' || opts.ipVersion === 'both') families.push(6);
+
+  const resolved = {};
+  for (const family of families) {
+    try {
+      const records = family === 4
+        ? await dns.resolve4(host)
+        : await dns.resolve6(host);
+      if (records.length > 0) {
+        resolved[family] = records[0];
+      }
+    } catch (err) {
+      // No record for this family - skip
+      if (opts.ipVersion === String(family)) {
+        console.error(`Error: no IPv${family} address for ${host}: ${err.message}`);
+        process.exit(1);
+      }
+    }
+  }
+
+  if (Object.keys(resolved).length === 0) {
+    console.error(`Error: no addresses resolved for ${host}`);
+    process.exit(1);
+  }
+
+  return resolved;
+}
+
+// ---------------------------------------------------------------------------
 // Test matrix
 // ---------------------------------------------------------------------------
 const COMBOS = [
@@ -124,10 +167,10 @@ const COMBOS = [
 // ---------------------------------------------------------------------------
 // Message generation
 // ---------------------------------------------------------------------------
-function buildMessage(combo, auth) {
+function buildMessage(combo, auth, family, address) {
   const id = randomUUID().slice(0, 8);
   const ts = new Date().toISOString();
-  const subject = `SMTP Test [${combo.label}${auth ? '+auth' : ''}] ${id}`;
+  const subject = `SMTP Test [${combo.label}/IPv${family}${auth ? '+auth' : ''}] ${id}`;
   const boundary = `----=_Part_${randomUUID().replace(/-/g, '')}`;
 
   const body = [
@@ -145,13 +188,14 @@ function buildMessage(combo, auth) {
     ``,
     `SMTP connectivity test`,
     ``,
-    `  ID:     ${id}`,
-    `  Time:   ${ts}`,
-    `  Host:   ${host}:${combo.port}`,
-    `  TLS:    ${combo.tls}`,
-    `  Auth:   ${auth ? opts.user : 'anonymous'}`,
-    `  From:   ${from}`,
-    `  To:     ${to}`,
+    `  ID:       ${id}`,
+    `  Time:     ${ts}`,
+    `  Host:     ${host}:${combo.port}`,
+    `  Address:  ${address} (IPv${family})`,
+    `  TLS:      ${combo.tls}`,
+    `  Auth:     ${auth ? opts.user : 'anonymous'}`,
+    `  From:     ${from}`,
+    `  To:       ${to}`,
     ``,
     `If you received this, the mail path is working.`,
     ``,
@@ -164,6 +208,7 @@ function buildMessage(combo, auth) {
     `<tr><td style="padding:4px 8px;color:#666">ID</td><td style="padding:4px 8px"><code>${id}</code></td></tr>`,
     `<tr><td style="padding:4px 8px;color:#666">Time</td><td style="padding:4px 8px">${ts}</td></tr>`,
     `<tr><td style="padding:4px 8px;color:#666">Host</td><td style="padding:4px 8px">${host}:${combo.port}</td></tr>`,
+    `<tr><td style="padding:4px 8px;color:#666">Address</td><td style="padding:4px 8px"><code>${address}</code> (IPv${family})</td></tr>`,
     `<tr><td style="padding:4px 8px;color:#666">TLS</td><td style="padding:4px 8px">${combo.tls}</td></tr>`,
     `<tr><td style="padding:4px 8px;color:#666">Auth</td><td style="padding:4px 8px">${auth ? opts.user : 'anonymous'}</td></tr>`,
     `<tr><td style="padding:4px 8px;color:#666">From</td><td style="padding:4px 8px">${from}</td></tr>`,
@@ -181,9 +226,8 @@ function buildMessage(combo, auth) {
 // ---------------------------------------------------------------------------
 // Single SMTP attempt
 // ---------------------------------------------------------------------------
-async function attempt(combo, auth) {
-  const { subject, body } = buildMessage(combo, auth);
-  const tag = `${combo.label}${auth ? '+auth' : ''}`;
+async function attempt(combo, auth, family, address) {
+  const { subject, body } = buildMessage(combo, auth, family, address);
   const log = opts.verbose
     ? (dir, line) => console.error(`    ${dir} ${line.trimEnd()}`)
     : () => {};
@@ -241,14 +285,14 @@ async function attempt(combo, auth) {
     });
   }
 
-  // connect
+  // Connect to the literal address so we pin the IP family
   if (combo.tls === 'implicit') {
     socket = tls.connect(
-      { host, port: combo.port, rejectUnauthorized: true },
+      { host: address, servername: host, port: combo.port, family, rejectUnauthorized: true },
       () => log('--', `TLS: ${socket.getProtocol()} ${socket.getCipher()?.name || ''}`)
     );
   } else {
-    socket = net.connect({ host, port: combo.port });
+    socket = net.connect({ host: address, port: combo.port, family });
   }
 
   socket.setTimeout(opts.timeout);
@@ -300,7 +344,7 @@ async function attempt(combo, auth) {
     send('QUIT');
     try { await waitFor(221); } catch { /* some servers just close */ }
 
-    return { tag, status: 'OK', subject };
+    return { status: 'OK', subject };
   } finally {
     socket.destroy();
   }
@@ -318,38 +362,49 @@ async function run() {
     }
   }
 
+  const addresses = await resolveAddresses();
+  const families = Object.keys(addresses).map(Number).sort();
+
   const hasAuth = !!(opts.user && opts.pass);
 
   const plan = [];
-  for (const combo of COMBOS) {
-    plan.push({ combo, auth: false });
-    if (hasAuth) plan.push({ combo, auth: true });
+  for (const family of families) {
+    for (const combo of COMBOS) {
+      plan.push({ combo, auth: false, family, address: addresses[family] });
+      if (hasAuth) plan.push({ combo, auth: true, family, address: addresses[family] });
+    }
   }
 
   console.error(`\nSMTP test: ${host} | ${from} -> ${to}`);
+  for (const family of families) {
+    console.error(`  IPv${family}: ${addresses[family]}`);
+  }
   console.error(`Running ${plan.length} combination${plan.length === 1 ? '' : 's'}...\n`);
 
   const results = [];
   const pad = (s, n) => s + ' '.repeat(Math.max(0, n - s.length));
 
-  for (const { combo, auth } of plan) {
-    const tag = `${combo.label}${auth ? '+auth' : ''}`;
-    process.stderr.write(`  ${pad(tag, 24)} `);
+  for (const { combo, auth, family, address } of plan) {
+    const tag = `IPv${family} ${combo.label}${auth ? '+auth' : ''}`;
+    process.stderr.write(`  ${pad(tag, 28)} `);
     try {
-      const r = await attempt(combo, auth);
-      results.push(r);
+      const r = await attempt(combo, auth, family, address);
+      results.push({ tag, family, ...r });
       console.error('\x1b[32mOK\x1b[0m');
     } catch (err) {
-      results.push({ tag, status: 'FAIL', error: err.message });
+      results.push({ tag, family, status: 'FAIL', error: err.message });
       console.error(`\x1b[31mFAIL\x1b[0m  ${err.message}`);
     }
   }
 
-  // Summary
   console.error('\n--- Summary ---');
-  const ok = results.filter(r => r.status === 'OK');
-  const fail = results.filter(r => r.status !== 'OK');
-  console.error(`  ${ok.length} passed, ${fail.length} failed\n`);
+  for (const family of families) {
+    const fr = results.filter(r => r.family === family);
+    const ok = fr.filter(r => r.status === 'OK').length;
+    const fail = fr.length - ok;
+    console.error(`  IPv${family}: ${ok} passed, ${fail} failed`);
+  }
+  console.error('');
 }
 
 run().catch(err => {
